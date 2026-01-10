@@ -1,11 +1,12 @@
 /**
- * Cloudflare Worker 多项目部署管理器 (最终完整版)
+ * Cloudflare Worker 多项目部署管理器 (自动更新增强版)
  * * 功能清单：
  * 1. [核心] 自动拉取 GitHub 代码 (beta2.0 / main)。
- * 2. [Token] 支持 GITHUB_TOKEN 环境变量，解除 API 请求限制。
+ * 2. [Token] 支持 GITHUB_TOKEN 环境变量。
  * 3. [检测] 实时对比上游版本，界面显示 "🔴 有新版本" 提示。
- * 4. [分流] 账号统一存储，Worker 按项目 (CMliu/Joey) 独立管理。
- * 5. [修复] 针对 Joey 项目自动注入 window 补丁。
+ * 4. [分流] CMliu/Joey 项目独立管理，配置互不干扰。
+ * 5. [自动化] 支持定时检查 GitHub 更新并自动部署 (需配置 Cron)。
+ * 6. [隐私] 账号列表支持折叠/展开。
  */
 
 // ==========================================
@@ -15,7 +16,6 @@ const TEMPLATES = {
   'cmliu': {
     name: "CMliu - EdgeTunnel",
     scriptUrl: "https://raw.githubusercontent.com/cmliu/edgetunnel/beta2.0/_worker.js",
-    // GitHub API 地址 (用于版本检测)
     apiUrl: "https://api.github.com/repos/cmliu/edgetunnel/commits/beta2.0",
     defaultVars: ["UUID", "PROXYIP", "PATH", "URL", "KEY", "ADMIN"],
     uuidField: "UUID",
@@ -24,19 +24,25 @@ const TEMPLATES = {
   'joey': {
     name: "Joey - 少年你相信光吗",
     scriptUrl: "https://raw.githubusercontent.com/byJoey/cfnew/main/%E5%B0%91%E5%B9%B4%E4%BD%A0%E7%9B%B8%E4%BF%A1%E5%85%89%E5%90%97",
-    // 针对单个文件检测更新
     apiUrl: "https://api.github.com/repos/byJoey/cfnew/commits?path=%E5%B0%91%E5%B9%B4%E4%BD%A0%E7%9B%B8%E4%BF%A1%E5%85%89%E5%90%97&per_page=1",
-    defaultVars: ["u"],
+    // update: 添加了默认变量 'd'
+    defaultVars: ["u", "d"],
     uuidField: "u",
     description: "Joey 项目 (自动修复版)"
   }
 };
 
 export default {
+  // ================= 定时任务 (Cron) 入口 =================
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(handleCronJob(env));
+  },
+
+  // ================= HTTP 请求入口 =================
   async fetch(request, env) {
     const url = new URL(request.url);
     
-    // 安全鉴权 (可选)
+    // 安全鉴权
     const correctCode = env.ACCESS_CODE; 
     const urlCode = url.searchParams.get("code");
     const cookieHeader = request.headers.get("Cookie") || "";
@@ -46,9 +52,10 @@ export default {
 
     // 初始化 KV 键名
     const type = url.searchParams.get("type") || "cmliu";
-    const ACCOUNTS_KEY = `ACCOUNTS_UNIFIED_STORAGE`; // 账号统一存
-    const VARS_KEY = `VARS_${type}`;                 // 变量分开存
-    const VERSION_KEY = `VERSION_INFO_${type}`;      // 版本信息分开存
+    const ACCOUNTS_KEY = `ACCOUNTS_UNIFIED_STORAGE`; 
+    const VARS_KEY = `VARS_${type}`;                 
+    const VERSION_KEY = `VERSION_INFO_${type}`; 
+    const AUTO_CONFIG_KEY = `AUTO_UPDATE_CFG_${type}`; // 新增：自动更新配置键名
 
     // ================= API 路由 =================
 
@@ -78,14 +85,32 @@ export default {
       }
     }
 
-    // 3. 版本检测 (带 GITHUB_TOKEN)
+    // 3. 自动更新配置 (GET/POST) [新增]
+    if (url.pathname === "/api/auto_config") {
+      if (request.method === "GET") {
+        const cfg = await env.CONFIG_KV.get(AUTO_CONFIG_KEY);
+        return new Response(cfg || "{}", { headers: { "Content-Type": "application/json" } });
+      }
+      if (request.method === "POST") {
+        const body = await request.json();
+        // 保存配置时，保留上次检查时间，避免重置
+        const oldCfg = JSON.parse(await env.CONFIG_KV.get(AUTO_CONFIG_KEY) || "{}");
+        body.lastCheck = oldCfg.lastCheck || 0; 
+        await env.CONFIG_KV.put(AUTO_CONFIG_KEY, JSON.stringify(body));
+        return new Response(JSON.stringify({ success: true }));
+      }
+    }
+
+    // 4. 版本检测
     if (url.pathname === "/api/check_update") {
         return await handleCheckUpdate(env, type, VERSION_KEY);
     }
 
-    // 4. 执行部署 (带 GITHUB_TOKEN)
+    // 5. 执行部署
     if (url.pathname === "/api/deploy" && request.method === "POST") {
-      return await handleBatchDeploy(request, env, type, ACCOUNTS_KEY, VERSION_KEY);
+      // 手动部署时，读取请求中的变量，不完全依赖KV
+      const { variables } = await request.json(); 
+      return await handleManualDeploy(env, type, variables, ACCOUNTS_KEY, VERSION_KEY);
     }
 
     // ================= 页面渲染 =================
@@ -98,11 +123,10 @@ export default {
 };
 
 /**
- * 辅助函数：构造带有 GitHub Token 的请求头
+ * 辅助：构造带有 GitHub Token 的请求头
  */
 function getGithubHeaders(env) {
     const headers = { "User-Agent": "Cloudflare-Worker-Manager" };
-    // 如果你在后台设置了 GITHUB_TOKEN 变量，这里会自动读取
     if (env.GITHUB_TOKEN && env.GITHUB_TOKEN.trim() !== "") {
         headers["Authorization"] = `token ${env.GITHUB_TOKEN}`;
     }
@@ -110,38 +134,76 @@ function getGithubHeaders(env) {
 }
 
 /**
- * 后端逻辑：检测更新
+ * 核心逻辑：定时任务处理
+ * 遍历所有项目模板，检查是否开启自动更新且达到时间间隔
+ */
+async function handleCronJob(env) {
+    const logs = [];
+    for (const type of Object.keys(TEMPLATES)) {
+        const AUTO_CONFIG_KEY = `AUTO_UPDATE_CFG_${type}`;
+        const configStr = await env.CONFIG_KV.get(AUTO_CONFIG_KEY);
+        if (!configStr) continue;
+
+        const config = JSON.parse(configStr);
+        // 检查开关和时间间隔
+        if (!config.enabled) continue;
+
+        const now = Date.now();
+        const lastCheck = config.lastCheck || 0;
+        const intervalMs = (config.interval || 24) * 60 * 60 * 1000; // 小时转毫秒
+
+        if (now - lastCheck > intervalMs) {
+            console.log(`[Cron] 正在检查 ${type} 更新...`);
+            
+            // 1. 检查版本
+            const VERSION_KEY = `VERSION_INFO_${type}`;
+            const checkRes = await handleCheckUpdate(env, type, VERSION_KEY);
+            const checkData = await checkRes.json();
+            
+            // 如果 GitHub 有新版本 (Remote SHA != Local SHA)
+            if (checkData.remote && (!checkData.local || checkData.remote.sha !== checkData.local.sha)) {
+                console.log(`[Cron] 发现新版本，开始部署 ${type}...`);
+                
+                // 2. 读取已保存的变量
+                const VARS_KEY = `VARS_${type}`; 
+                const varsStr = await env.CONFIG_KV.get(VARS_KEY);
+                const variables = varsStr ? JSON.parse(varsStr) : [];
+                
+                // 3. 执行部署
+                const ACCOUNTS_KEY = `ACCOUNTS_UNIFIED_STORAGE`;
+                await coreDeployLogic(env, type, variables, ACCOUNTS_KEY, VERSION_KEY);
+            }
+            
+            // 4. 更新最后检查时间
+            config.lastCheck = now;
+            await env.CONFIG_KV.put(AUTO_CONFIG_KEY, JSON.stringify(config));
+        }
+    }
+}
+
+/**
+ * 逻辑：检测更新 (API 返回)
  */
 async function handleCheckUpdate(env, type, versionKey) {
     try {
         const config = TEMPLATES[type];
         if(!config) return new Response(JSON.stringify({error: "Unknown type"}));
 
-        // 读取本地上次部署记录
         const localDataStr = await env.CONFIG_KV.get(versionKey);
         const localData = localDataStr ? JSON.parse(localDataStr) : null;
 
-        // 请求 GitHub API (带 Token)
         const ghRes = await fetch(config.apiUrl, { headers: getGithubHeaders(env) });
-        
         if (!ghRes.ok) {
-            // 详细报错提示
-            if(ghRes.status === 403) throw new Error("GitHub API 频率超限 (请配置 GITHUB_TOKEN)");
+            if(ghRes.status === 403) throw new Error("GitHub API 频率超限");
             throw new Error(`GitHub API Error: ${ghRes.status}`);
         }
         
         const ghData = await ghRes.json();
         const commitObj = Array.isArray(ghData) ? ghData[0] : ghData;
         
-        const remoteInfo = {
-            sha: commitObj.sha,
-            date: commitObj.commit.committer.date,
-            message: commitObj.commit.message
-        };
-
         return new Response(JSON.stringify({
             local: localData,
-            remote: remoteInfo
+            remote: { sha: commitObj.sha, date: commitObj.commit.committer.date, message: commitObj.commit.message }
         }), { headers: { "Content-Type": "application/json" } });
 
     } catch (e) {
@@ -150,123 +212,117 @@ async function handleCheckUpdate(env, type, versionKey) {
 }
 
 /**
- * 后端逻辑：批量部署
+ * 逻辑：手动触发部署
  */
-async function handleBatchDeploy(request, env, type, accountsKey, versionKey) {
-  try {
-    const { variables } = await request.json(); 
-    const templateConfig = TEMPLATES[type];
-    
-    // 1. 读取账号
-    const accounts = JSON.parse(await env.CONFIG_KV.get(accountsKey) || "[]");
-    if (accounts.length === 0) return new Response(JSON.stringify([{ name: "提示", success: false, msg: "请先添加账号" }]));
-    
-    // 2. 拉取代码 & 版本信息 (带 Token)
-    let githubScriptContent = "";
-    let currentSha = "";
-    
+async function handleManualDeploy(env, type, variables, accountsKey, versionKey) {
+    const logs = await coreDeployLogic(env, type, variables, accountsKey, versionKey);
+    return new Response(JSON.stringify(logs), { headers: { "Content-Type": "application/json" } });
+}
+
+/**
+ * 核心部署逻辑 (被 手动API 和 Cron 共用)
+ */
+async function coreDeployLogic(env, type, variables, accountsKey, versionKey) {
     try {
-        // 并行请求：代码(Raw) + 版本信息(API)
-        const [codeRes, apiRes] = await Promise.all([
-            fetch(templateConfig.scriptUrl),
-            fetch(templateConfig.apiUrl, { headers: getGithubHeaders(env) })
-        ]);
+        const templateConfig = TEMPLATES[type];
+        
+        // 1. 读取账号
+        const accounts = JSON.parse(await env.CONFIG_KV.get(accountsKey) || "[]");
+        if (accounts.length === 0) return [{ name: "提示", success: false, msg: "无账号配置" }];
+        
+        // 2. 拉取代码 & 版本
+        let githubScriptContent = "";
+        let currentSha = "";
+        
+        try {
+            const [codeRes, apiRes] = await Promise.all([
+                fetch(templateConfig.scriptUrl),
+                fetch(templateConfig.apiUrl, { headers: getGithubHeaders(env) })
+            ]);
 
-        if (!codeRes.ok) throw new Error(`代码下载失败: ${codeRes.status}`);
-        githubScriptContent = await codeRes.text();
+            if (!codeRes.ok) throw new Error(`代码下载失败: ${codeRes.status}`);
+            githubScriptContent = await codeRes.text();
 
-        // 尝试获取版本 SHA 用于记录
-        if (apiRes.ok) {
-            const apiData = await apiRes.json();
-            const commitObj = Array.isArray(apiData) ? apiData[0] : apiData;
-            currentSha = commitObj.sha;
+            if (apiRes.ok) {
+                const apiData = await apiRes.json();
+                const commitObj = Array.isArray(apiData) ? apiData[0] : apiData;
+                currentSha = commitObj.sha;
+            }
+        } catch (e) {
+            return [{ name: "网络错误", success: false, msg: "GitHub连接失败: " + e.message }];
         }
-    } catch (e) {
-        return new Response(JSON.stringify([{ name: "网络错误", success: false, msg: "GitHub连接失败: " + e.message }]));
-    }
 
-    // 3. 针对 Joey 项目注入 window 补丁 (关键!)
-    if (type === 'joey') {
-        githubScriptContent = 'var window = globalThis;\n' + githubScriptContent;
-    }
+        // 3. 注入补丁
+        if (type === 'joey') {
+            githubScriptContent = 'var window = globalThis;\n' + githubScriptContent;
+        }
 
-    // 4. 遍历账号进行部署
-    const logs = [];
-    let updateCount = 0;
-    
-    for (const acc of accounts) {
-      // 这里的逻辑确保只更新当前项目对应的 Worker
-      const targetWorkers = acc[`workers_${type}`] || [];
-      if (!Array.isArray(targetWorkers) || targetWorkers.length === 0) continue;
+        // 4. 遍历部署
+        const logs = [];
+        let updateCount = 0;
+        
+        for (const acc of accounts) {
+          const targetWorkers = acc[`workers_${type}`] || [];
+          if (!Array.isArray(targetWorkers) || targetWorkers.length === 0) continue;
 
-      for (const wName of targetWorkers) {
-          updateCount++;
-          const logItem = { name: `${acc.alias} -> [${wName}]`, success: false, msg: "" };
-          let step = "准备";
-          
-          try {
-            const baseUrl = `https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/scripts/${wName}`;
-            const headers = { "Authorization": `Bearer ${acc.apiToken}` };
+          for (const wName of targetWorkers) {
+              updateCount++;
+              const logItem = { name: `${acc.alias} -> [${wName}]`, success: false, msg: "" };
+              
+              try {
+                const baseUrl = `https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/scripts/${wName}`;
+                const headers = { "Authorization": `Bearer ${acc.apiToken}` };
 
-            // A. 读取现有配置
-            step = "读取配置";
-            const bindingsRes = await fetch(`${baseUrl}/bindings`, { headers });
-            if (!bindingsRes.ok && bindingsRes.status !== 404) throw new Error(`API错误 ${bindingsRes.status}`);
-            const currentBindings = bindingsRes.ok ? (await bindingsRes.json()).result : [];
+                const bindingsRes = await fetch(`${baseUrl}/bindings`, { headers });
+                const currentBindings = bindingsRes.ok ? (await bindingsRes.json()).result : [];
 
-            // B. 合并变量
-            step = "合并变量";
-            if (variables && variables.length > 0) {
-                for (const newVar of variables) {
-                    if (newVar.value && newVar.value.trim() !== "") {
-                        const idx = currentBindings.findIndex(b => b.name === newVar.key);
-                        if (idx !== -1) currentBindings[idx] = { name: newVar.key, type: "plain_text", text: newVar.value };
-                        else currentBindings.push({ name: newVar.key, type: "plain_text", text: newVar.value });
+                if (variables && variables.length > 0) {
+                    for (const newVar of variables) {
+                        if (newVar.value && newVar.value.trim() !== "") {
+                            const idx = currentBindings.findIndex(b => b.name === newVar.key);
+                            if (idx !== -1) currentBindings[idx] = { name: newVar.key, type: "plain_text", text: newVar.value };
+                            else currentBindings.push({ name: newVar.key, type: "plain_text", text: newVar.value });
+                        }
                     }
                 }
-            }
 
-            // C. 上传部署
-            step = "上传部署";
-            const metadata = { main_module: "index.js", bindings: currentBindings, compatibility_date: "2024-01-01" };
-            const formData = new FormData();
-            formData.append("metadata", JSON.stringify(metadata));
-            formData.append("script", new Blob([githubScriptContent], { type: "application/javascript+module" }), "index.js");
+                const metadata = { main_module: "index.js", bindings: currentBindings, compatibility_date: "2024-01-01" };
+                const formData = new FormData();
+                formData.append("metadata", JSON.stringify(metadata));
+                formData.append("script", new Blob([githubScriptContent], { type: "application/javascript+module" }), "index.js");
 
-            const updateRes = await fetch(baseUrl, { method: "PUT", headers, body: formData });
-            
-            if (updateRes.ok) {
-              logItem.success = true;
-              logItem.msg = `✅ 更新成功`;
-            } else {
-              const errData = await updateRes.json();
-              logItem.msg = `❌ ${errData.errors?.[0]?.message}`;
-            }
+                const updateRes = await fetch(baseUrl, { method: "PUT", headers, body: formData });
+                
+                if (updateRes.ok) {
+                  logItem.success = true;
+                  logItem.msg = `✅ 更新成功`;
+                } else {
+                  const errData = await updateRes.json();
+                  logItem.msg = `❌ ${errData.errors?.[0]?.message}`;
+                }
 
-          } catch (err) {
-            logItem.msg = `❌ [${step}] ${err.message}`;
-          }
-          logs.push(logItem);
-      } 
+              } catch (err) {
+                logItem.msg = `❌ ${err.message}`;
+              }
+              logs.push(logItem);
+          } 
+        }
+        
+        if (updateCount > 0 && currentSha) {
+            await env.CONFIG_KV.put(versionKey, JSON.stringify({ sha: currentSha, deployDate: new Date().toISOString() }));
+        }
+
+        return logs.length > 0 ? logs : [{ name: "提示", success: true, msg: `当前项目 (${type}) 未配置任何 Worker` }];
+
+    } catch (e) {
+        return [{ name: "系统错误", success: false, msg: e.message }];
     }
-    
-    // 5. 部署成功后，更新本地版本记录
-    if (updateCount > 0 && currentSha) {
-        await env.CONFIG_KV.put(versionKey, JSON.stringify({ sha: currentSha, deployDate: new Date().toISOString() }));
-    }
-
-    if (updateCount === 0) return new Response(JSON.stringify([{ name: "提示", success: true, msg: `当前项目 (${type}) 未配置任何 Worker` }]));
-
-    return new Response(JSON.stringify(logs), { headers: { "Content-Type": "application/json" } });
-  } catch (e) {
-    return new Response(JSON.stringify([{ name: "系统错误", success: false, msg: e.message }]));
-  }
 }
 
 function loginHtml() { return `<!DOCTYPE html><html><body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f3f4f6"><form method="GET"><input type="password" name="code" placeholder="密码" style="padding:10px"><button style="padding:10px">登录</button></form></body></html>`; }
 
 // ==========================================
-// 前端页面代码 (完整展开，方便修改)
+// 前端页面代码
 // ==========================================
 function mainHtml() {
   return `
@@ -274,7 +330,7 @@ function mainHtml() {
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>Worker 智能中控 (Full Version)</title>
+  <title>Worker 智能中控 (Auto Update)</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     .input-field { border: 1px solid #cbd5e1; padding: 0.5rem; width:100%; border-radius: 4px; transition:all 0.2s;} 
@@ -283,6 +339,8 @@ function mainHtml() {
     .theme-joey { border-color: #3b82f6; }  
     @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
     .update-badge { animation: pulse-red 2s infinite; }
+    .toggle-checkbox:checked { right: 0; border-color: #68D391; }
+    .toggle-checkbox:checked + .toggle-label { background-color: #68D391; }
   </style>
 </head>
 <body class="bg-slate-100 p-4 md:p-8">
@@ -314,37 +372,44 @@ function mainHtml() {
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
       
       <div class="lg:col-span-2 bg-white p-6 rounded shadow flex flex-col h-fit">
-        <h2 class="font-bold mb-4 border-b pb-2 text-gray-700">📡 账号管理 (通用)</h2>
-        
-        <div class="bg-slate-50 p-4 mb-4 border rounded shadow-inner">
-           <div class="space-y-3 mb-3">
-             <div class="flex gap-3">
-                 <input id="in_alias" placeholder="备注 (如: 主力账号)" class="input-field w-1/3 font-bold">
-                 <input id="in_id" placeholder="Account ID (32位)" class="input-field w-2/3 text-blue-600 font-mono">
-             </div>
-             <div>
-                 <input id="in_token" type="password" placeholder="API Token (必须有 Edit Workers 权限)" class="input-field">
-             </div>
-             
-             <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-gray-200 mt-2">
-                 <div>
-                    <label class="text-xs font-bold text-red-600 mb-1 block">🔴 CMliu Workers</label>
-                    <input id="in_workers_cmliu" placeholder="用逗号隔开" class="input-field font-mono bg-red-50 border-red-200 focus:border-red-400">
-                 </div>
-                 <div>
-                    <label class="text-xs font-bold text-blue-600 mb-1 block">🔵 Joey Workers</label>
-                    <input id="in_workers_joey" placeholder="用逗号隔开" class="input-field font-mono bg-blue-50 border-blue-200 focus:border-blue-400">
-                 </div>
-             </div>
-           </div>
-           <button onclick="addAccount()" id="btnSave" class="w-full bg-slate-700 text-white py-2 rounded font-bold hover:bg-slate-800 transition shadow-md">保存 / 更新账号</button>
+        <div class="flex justify-between items-center mb-4 border-b pb-2">
+            <h2 class="font-bold text-gray-700">📡 账号管理 (通用)</h2>
+            <button onclick="toggleAccounts()" id="btn_toggle_acc" class="text-xs bg-gray-100 hover:bg-gray-200 px-3 py-1 rounded text-gray-600 transition">
+                🙈 隐藏列表
+            </button>
         </div>
+        
+        <div id="account_container" class="transition-all duration-300">
+            <div class="bg-slate-50 p-4 mb-4 border rounded shadow-inner">
+               <div class="space-y-3 mb-3">
+                 <div class="flex gap-3">
+                     <input id="in_alias" placeholder="备注 (如: 主力账号)" class="input-field w-1/3 font-bold">
+                     <input id="in_id" placeholder="Account ID (32位)" class="input-field w-2/3 text-blue-600 font-mono">
+                 </div>
+                 <div>
+                     <input id="in_token" type="password" placeholder="API Token (必须有 Edit Workers 权限)" class="input-field">
+                 </div>
+                 
+                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-gray-200 mt-2">
+                     <div>
+                        <label class="text-xs font-bold text-red-600 mb-1 block">🔴 CMliu Workers</label>
+                        <input id="in_workers_cmliu" placeholder="用逗号隔开" class="input-field font-mono bg-red-50 border-red-200 focus:border-red-400">
+                     </div>
+                     <div>
+                        <label class="text-xs font-bold text-blue-600 mb-1 block">🔵 Joey Workers</label>
+                        <input id="in_workers_joey" placeholder="用逗号隔开" class="input-field font-mono bg-blue-50 border-blue-200 focus:border-blue-400">
+                     </div>
+                 </div>
+               </div>
+               <button onclick="addAccount()" id="btnSave" class="w-full bg-slate-700 text-white py-2 rounded font-bold hover:bg-slate-800 transition shadow-md">保存 / 更新账号</button>
+            </div>
 
-        <div class="overflow-x-auto">
-          <table class="w-full text-sm text-left">
-            <thead class="bg-gray-50 text-gray-500"><tr><th class="p-2 w-1/5">备注</th><th class="p-2">Worker 分配详情</th><th class="p-2 w-20 text-right">操作</th></tr></thead>
-            <tbody id="tableBody"></tbody>
-          </table>
+            <div class="overflow-x-auto">
+              <table class="w-full text-sm text-left">
+                <thead class="bg-gray-50 text-gray-500"><tr><th class="p-2 w-1/5">备注</th><th class="p-2">Worker 分配详情</th><th class="p-2 w-20 text-right">操作</th></tr></thead>
+                <tbody id="tableBody"></tbody>
+              </table>
+            </div>
         </div>
       </div>
 
@@ -360,6 +425,22 @@ function mainHtml() {
                 <span id="local_time" class="text-gray-800 font-mono">...</span>
             </div>
             <div id="update_msg" class="text-center font-bold pt-1 text-green-600"></div>
+        </div>
+
+        <div class="mb-4 bg-blue-50 border border-blue-100 rounded p-3">
+            <h3 class="text-xs font-bold text-blue-800 mb-2 flex items-center gap-1">⏰ 自动更新设置 (独立)</h3>
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs text-gray-600">启用自动部署</span>
+                <div class="relative inline-block w-10 mr-2 align-middle select-none transition duration-200 ease-in">
+                    <input type="checkbox" name="toggle" id="auto_update_toggle" class="toggle-checkbox absolute block w-5 h-5 rounded-full bg-white border-4 appearance-none cursor-pointer border-gray-300"/>
+                    <label for="auto_update_toggle" class="toggle-label block overflow-hidden h-5 rounded-full bg-gray-300 cursor-pointer"></label>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="text-xs text-gray-600">检查间隔(小时):</span>
+                <input type="number" id="auto_update_interval" min="1" value="24" class="w-16 p-1 text-xs border rounded text-center">
+                <button onclick="saveAutoConfig()" class="text-xs bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-700 ml-auto">保存设置</button>
+            </div>
         </div>
 
         <h2 class="font-bold mb-4 border-b pb-2 flex justify-between items-center">
@@ -390,7 +471,7 @@ function mainHtml() {
     // 定义模板
     const TEMPLATES = {
       'cmliu': { defaultVars: ["UUID", "PROXYIP", "PATH", "URL", "KEY", "ADMIN"], uuidField: "UUID", desc: "CMliu 项目 (标准变量)" },
-      'joey':  { defaultVars: ["u"], uuidField: "u", desc: "Joey 项目 (代码修复)" }
+      'joey':  { defaultVars: ["u", "d"], uuidField: "u", desc: "Joey 项目 (代码修复)" }
     };
 
     let accounts = [];
@@ -441,20 +522,56 @@ function mainHtml() {
         panel.className = \`lg:col-span-1 bg-white p-6 rounded shadow h-fit border-t-4 transition-colors duration-300 \${currentTemplate === 'cmliu' ? 'theme-cmliu' : 'theme-joey'}\`;
 
         try {
-            const [accRes, settingRes] = await Promise.all([
+            const [accRes, settingRes, autoCfgRes] = await Promise.all([
                 fetch(\`/api/accounts\`),
-                fetch(\`/api/settings?type=\${currentTemplate}\`)
+                fetch(\`/api/settings?type=\${currentTemplate}\`),
+                fetch(\`/api/auto_config?type=\${currentTemplate}\`) // 加载自动更新配置
             ]);
             accounts = await accRes.json();
             const savedSettings = await settingRes.json();
+            const autoConfig = await autoCfgRes.json();
+            
             renderTable(); 
             initVars(savedSettings);
+            initAutoConfig(autoConfig); // 初始化自动更新UI
 
             // 异步检测更新
             checkUpdate();
         } catch(e) { alert("加载失败: " + e.message); }
     }
     
+    // 初始化自动更新UI
+    function initAutoConfig(cfg) {
+        document.getElementById('auto_update_toggle').checked = !!cfg.enabled;
+        document.getElementById('auto_update_interval').value = cfg.interval || 24;
+    }
+
+    // 保存自动更新配置
+    async function saveAutoConfig() {
+        const enabled = document.getElementById('auto_update_toggle').checked;
+        const interval = parseInt(document.getElementById('auto_update_interval').value) || 24;
+        try {
+            await fetch(\`/api/auto_config?type=\${currentTemplate}\`, {
+                method: 'POST', 
+                body: JSON.stringify({ enabled, interval })
+            });
+            alert("✅ 自动更新设置已保存 (请确保配置了 Cron Trigger)");
+        } catch(e) { alert("保存失败"); }
+    }
+
+    // 显示/隐藏账号列表
+    function toggleAccounts() {
+        const container = document.getElementById('account_container');
+        const btn = document.getElementById('btn_toggle_acc');
+        if (container.classList.contains('hidden')) {
+            container.classList.remove('hidden');
+            btn.innerText = "🙈 隐藏列表";
+        } else {
+            container.classList.add('hidden');
+            btn.innerText = "👁️ 显示列表";
+        }
+    }
+
     // 版本检测
     async function checkUpdate() {
         const els = {
@@ -542,6 +659,10 @@ function mainHtml() {
 
     function edit(i) {
       const a = accounts[i];
+      // 如果列表被隐藏了，自动展开
+      document.getElementById('account_container').classList.remove('hidden');
+      document.getElementById('btn_toggle_acc').innerText = "🙈 隐藏列表";
+      
       document.getElementById('in_alias').value = a.alias;
       document.getElementById('in_id').value = a.accountId;
       document.getElementById('in_token').value = a.apiToken;
