@@ -1,5 +1,6 @@
 # 🚀 Cloudflare Worker 多项目部署中控 (Timer Enhanced V3.4)
-<img width="995" height="893" alt="image" src="https://github.com/user-attachments/assets/fb4b501f-1d49-441f-a194-504292aa5746" />
+
+<img width="1460" height="895" alt="image" src="https://github.com/user-attachments/assets/cfcd0ae8-5039-4893-84bc-dc0095663a5c" />
 
 这是一个基于 Cloudflare Worker 的**多项目集中部署与自动化管理平台**。它允许你在一个统一的 Dashboard 中管理、监控并自动维护多个 Worker 项目（目前支持 **CMliu (EdgeTunnel)** 和 **Joey (CFNew)**）。
 
