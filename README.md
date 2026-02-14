@@ -1,40 +1,16 @@
-# 🚀 Cloudflare Worker 智能部署中控 (V10.0.0)
+# 🚀 Cloudflare Worker 智能部署中控 (V9.9.6 Pro)
 
 > 全部代码为 Claude Code 完成
 > 自行修改延伸功能
 
-> **版本状态**: V10.0.0 Stable
-> **核心进化**: 全面 **安全加固**、**缺陷修复** 与 **代码质量改进**。
+> **版本状态**: V9.9.6 Stable
+> **核心进化**: 引入 **服务器端代码混淆**、**熔断保护机制** 与 **收藏版本管理**。
 
 本项目是一个基于 Cloudflare Worker 构建的深度集成化部署管理平台。它不仅能管理多个 Cloudflare 账号，还支持一键批量部署、版本回滚、自动化流量熔断以及代码级的混淆加固，是管理大规模 Worker 节点的终极工具。
 
 ---
 
-## 🆕 V10.0.0 更新日志
-
-### 🔐 安全加固
-
-* **登录改为 POST 提交**：密码不再通过 URL 明文传递（避免浏览器历史记录、日志泄露），改为 `POST /api/login` 接口 + JSON 提交。
-* **Cookie 增加 Secure 标志**：`Set-Cookie` 新增 `Secure` 属性，确保仅通过 HTTPS 传输。
-* **API 方法校验**：所有只读接口（`/api/check_update`、`/api/get_code`、`/api/stats`、`/api/deploy_config`）限制为 `GET` 方法。
-* **CSRF 防护**：所有 `POST` 请求自动校验 `Origin` 头，防止跨站请求伪造。
-* **统一错误响应**：错误信息统一返回 JSON 格式，不再泄露 stack trace。
-
-### 🐛 缺陷修复
-
-* **修复混淆正则 bug**：`serverSideObfuscate` 原有正则会误删代码中的 URL（如 `https://`），改为仅删除行首注释和块注释。
-* **修复 checkUpdate 变量冲突**：`catch(e)` 与外部 DOM 元素 `e` 冲突，导致检查失败时无法显示错误信息。重命名为 `catch(err)`。
-* **修复编辑账号 stats 重置**：编辑账号时不再将流量统计数据重置为零，保留已有 stats。
-
-### ⚡ 改进优化
-
-* **熔断/自动更新动态化**：不再硬编码 `cmliu`/`joey`，改为从 `TEMPLATES` 动态识别有 `uuidField` 的模板。新增模板自动参与熔断和自动更新。
-* **compatibility_date 动态化**：部署时自动使用当前日期，不再硬编码 `2024-01-01`。
-* **消除前后端数据重复**：前端 `TEMPLATES` 和 `ECH_PROXIES` 改为由后端 `mainHtml()` 函数动态注入，不再需要同步两份配置。
-
----
-
-## ✨ 核心特性
+## ✨ V9.9.6 核心新特性
 
 ### 🔐 智能混淆体系 (Obfuscation Pro)
 
@@ -83,7 +59,7 @@
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)。
 2. 进入 **Workers & Pages** -> **Overview** -> **Create Application** -> **Create Worker**。
 3. 命名为 `manager` (建议)，点击 **Deploy**。
-4. 点击 **Edit code**，将本项目提供的 `worker.js` (V10.0.0) **完整代码** 粘贴覆盖。
+4. 点击 **Edit code**，将本项目提供的 `worker.js` (V9.9.6) **完整代码** 粘贴覆盖。
 5. 点击 **Save and deploy**。
 
 ### 2️⃣ 第二步：绑定 KV 存储 (⚠️ 核心)
