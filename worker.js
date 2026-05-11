@@ -13,7 +13,7 @@ const TEMPLATES = {
         name: "CMliu - EdgeTunnel",
         ghUser: "cmliu",
         ghRepo: "edgetunnel",
-        ghBranch: "beta2.0",
+        ghBranch: "main",
         ghPath: "_worker.js",
         defaultVars: ["UUID", "PROXYIP", "DOH", "PATH", "URL", "KEY", "ADMIN"],
         uuidField: "UUID",
